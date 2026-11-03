@@ -4,6 +4,7 @@ import (
 	"context"
 	"devagent/agent"
 	"devagent/session"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,6 +27,21 @@ var (
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")).
 			Bold(true)
+)
+
+// 用于 Markdown 渲染的样式与正则。
+var (
+	mdHeading    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	mdCodeBlock  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	mdInlineCode = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Background(lipgloss.Color("236"))
+	mdBold       = lipgloss.NewStyle().Bold(true)
+	mdItalic     = lipgloss.NewStyle().Italic(true)
+	mdQuote      = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	mdLink       = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Underline(true)
+
+	headingRe = regexp.MustCompile(`^#{1,6}\s`)
+	hrRe      = regexp.MustCompile(`^\s*([-*_]\s*){3,}$`)
+	inlineRe  = regexp.MustCompile("`[^`]+`|\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|\\[[^\\]]+\\]\\([^)]*\\)")
 )
 
 type chatMessage struct {
@@ -187,12 +203,72 @@ func renderMessages(messages []chatMessage) string {
 		case "error":
 			b.WriteString(errorStyle.Render("错误："))
 		default:
-			b.WriteString(msg.role + ": ")
+			b.WriteString(msg.role + ":")
 		}
-		b.WriteString(msg.content)
+		b.WriteString("\n")
+		if msg.role == "agent" {
+			b.WriteString(renderMarkdown(msg.content))
+		} else {
+			b.WriteString(msg.content)
+		}
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+// renderMarkdown 把模型的 Markdown 回答渲染成带 ANSI 样式的文本。
+// 只处理 LLM 输出里最常见的元素：代码块、标题、分隔线、引用、加粗、斜体、行内代码、链接。
+func renderMarkdown(md string) string {
+	lines := strings.Split(md, "\n")
+	var b strings.Builder
+	inCode := false
+	for _, line := range lines {
+		t := strings.TrimRight(line, " \t")
+		if strings.HasPrefix(t, "```") {
+			inCode = !inCode
+			continue
+		}
+		if inCode {
+			b.WriteString(mdCodeBlock.Render(t))
+			b.WriteString("\n")
+			continue
+		}
+		switch {
+		case headingRe.MatchString(t):
+			b.WriteString(mdHeading.Render(t))
+		case hrRe.MatchString(t):
+			b.WriteString(strings.Repeat("─", 40))
+		case strings.HasPrefix(t, ">"):
+			b.WriteString(mdQuote.Render(strings.TrimSpace(strings.TrimPrefix(t, ">"))))
+		case strings.TrimSpace(t) == "":
+			// 空行，仅换行。
+		default:
+			b.WriteString(renderInline(t))
+		}
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// renderInline 处理行内的加粗、斜体、行内代码和链接。
+func renderInline(s string) string {
+	return inlineRe.ReplaceAllStringFunc(s, func(m string) string {
+		switch {
+		case strings.HasPrefix(m, "`") && strings.HasSuffix(m, "`") && len(m) >= 2:
+			return mdInlineCode.Render(m[1 : len(m)-1])
+		case strings.HasPrefix(m, "**") && strings.HasSuffix(m, "**") && len(m) >= 4:
+			return mdBold.Render(m[2 : len(m)-2])
+		case strings.HasPrefix(m, "[") && strings.HasSuffix(m, ")"):
+			inner := m[1 : len(m)-1]
+			if i := strings.Index(inner, "]("); i >= 0 {
+				return mdLink.Render(inner[:i])
+			}
+			return m
+		case strings.HasPrefix(m, "*") && strings.HasSuffix(m, "*") && len(m) >= 2:
+			return mdItalic.Render(m[1 : len(m)-1])
+		}
+		return m
+	})
 }
 
 func isScrollKey(msg tea.KeyPressMsg) bool {
