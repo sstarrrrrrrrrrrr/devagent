@@ -6,9 +6,12 @@ import (
 	"os"
 )
 
+// Config 是 mcp.json 的顶层结构。
 type Config struct {
 	MCPServers map[string]ServerConfig `json:"mcpServers"`
 }
+
+// ServerConfig 描述一个 MCP Server 的启动方式。
 type ServerConfig struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`

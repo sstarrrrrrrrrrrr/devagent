@@ -13,6 +13,7 @@ import (
 	"github.com/openai/openai-go/v3/responses"
 )
 
+// Agent 负责协调大模型、工具和对话历史。
 type Agent struct {
 	client      openai.Client
 	openAITools []responses.ToolUnionParam
@@ -24,6 +25,7 @@ type Agent struct {
 	mcpManager *devmcp.Manager
 }
 
+// NewAgent 创建 Agent，连接 MCP 并注册工具。
 func NewAgent() (*Agent, error) {
 	// 1. 获取 API Key
 	apiKey := os.Getenv("DEEPSEEK_API_KEY")
@@ -110,6 +112,7 @@ func NewAgent() (*Agent, error) {
 	return agent, nil
 }
 
+// RunAgent 执行用户任务，循环处理工具调用，直到得到最终回答。
 func (a *Agent) RunAgent(
 	ctx context.Context,
 	s *session.Session,
@@ -167,6 +170,7 @@ func (a *Agent) RunAgent(
 	return "", fmt.Errorf("超过最大工具调用轮数 %d，停止执行", maxRounds)
 }
 
+// message 构造一条对话消息。
 func message(role, text string) responses.ResponseInputItemUnionParam {
 	return responses.ResponseInputItemUnionParam{
 		OfInputMessage: &responses.ResponseInputItemMessageParam{
@@ -178,6 +182,7 @@ func message(role, text string) responses.ResponseInputItemUnionParam {
 	}
 }
 
+// buildModelParams 统一构造模型请求参数。
 func (a *Agent) buildModelParams(
 	input responses.ResponseNewParamsInputUnion,
 ) responses.ResponseNewParams {
@@ -194,7 +199,7 @@ func (a *Agent) buildModelParams(
 				"\n5. 如果信息不足以得出可靠结论，应明确指出缺少什么信息，不要猜测后当成事实回答。" +
 				"\n\n二、当前可用能力" +
 				"\n1. 读取文件：可以使用 read_file 工具读取允许访问范围内的文本文件。" +
-				"\n2. 查看目录：可以使用 list_directory 工具查看允许访问范围内的目录及其内容。" +
+				"\n2. 查看目录：可以使用 list_files 工具查看允许访问范围内的目录及其内容。" +
 				"\n3. 获取工作目录：可以使用 get_current_dir 工具获取当前工作目录。" +
 				"\n4. 代码分析：可以根据用户提供的代码、文件内容和工具返回结果，分析代码逻辑、函数调用关系、潜在问题并提出修改建议。" +
 				"\n5. 项目理解：可以通过查看目录和读取文件，逐步梳理项目结构、模块职责及调用流程。" +
@@ -238,6 +243,7 @@ func (a *Agent) buildModelParams(
 	}
 }
 
+// registerTools 注册全部工具：检查重名、保存执行逻辑、转成 OpenAI 工具声明。
 func registerTools(
 	allTools []tools.Tool,
 ) (map[string]tools.Tool, []responses.ToolUnionParam, error) {

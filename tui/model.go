@@ -300,6 +300,7 @@ func Run() error {
 	if err != nil {
 		return err
 	}
+	defer model.agent.Close()
 	P := tea.NewProgram(model)
 	_, err = P.Run()
 	return err

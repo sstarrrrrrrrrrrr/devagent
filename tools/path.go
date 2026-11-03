@@ -6,6 +6,7 @@ import (
 	"strings"
 )
 
+// resolvePathWithin 校验并解析路径，确保目标位于 root 之内（含符号链接检查），
 // 返回解析后的真实绝对路径。
 func resolvePathWithin(root, path string) (string, error) {
 	rootAbs, err := filepath.Abs(root)

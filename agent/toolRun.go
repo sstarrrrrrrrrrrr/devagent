@@ -10,6 +10,7 @@ import (
 	"github.com/openai/openai-go/v3/responses"
 )
 
+// runTool 执行模型请求的工具，返回工具调用记录和执行结果。
 func runTool(
 	ctx context.Context,
 	item responses.ResponseOutputItemUnion,
@@ -45,6 +46,8 @@ func runTool(
 	// 4. 构造模型需要的工具执行结果
 	return buildToolOutput(item, result)
 }
+
+// buildToolOutput 构造模型的工具调用记录和工具执行结果。
 func buildToolOutput(
 	item responses.ResponseOutputItemUnion,
 	result string,

@@ -8,8 +8,10 @@ import (
 	"strings"
 )
 
+// maxReadSize 是 read_file 单次返回给模型的最大字节数，防止超大文件撑爆上下文。
 const maxReadSize = 64 * 1024
 
+// ReadFileTool 读取项目根目录内的文本文件。
 var ReadFileTool = Tool{
 	Name:        "read_file",
 	Description: "读取项目根目录内的文本文件，不允许访问项目目录之外的文件",

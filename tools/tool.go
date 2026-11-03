@@ -2,12 +2,12 @@ package tools
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/responses"
 )
 
+// Tool 描述一个可供模型调用的工具。
 type Tool struct {
 	Name        string
 	Description string
@@ -15,6 +15,7 @@ type Tool struct {
 	Parameters  map[string]any
 }
 
+// ToOpenAITool 把工具转成 OpenAI 的工具声明。
 func (t Tool) ToOpenAITool() responses.ToolUnionParam {
 	return responses.ToolUnionParam{
 		OfFunction: &responses.FunctionToolParam{
@@ -25,13 +26,5 @@ func (t Tool) ToOpenAITool() responses.ToolUnionParam {
 	}
 }
 
+// All 是 Agent 使用的本地工具集合，新增本地工具时在这里登记。
 var All = []Tool{ReadFileTool, CurrentDirTool, ListFilesTool}
-
-func Execute(ctx context.Context, name string, args map[string]any) (string, error) {
-	for _, t := range All {
-		if t.Name == name {
-			return t.Execute(ctx, args)
-		}
-	}
-	return "", fmt.Errorf("tool %s not found", name)
-}

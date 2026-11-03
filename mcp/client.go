@@ -90,6 +90,7 @@ func (m *Manager) Close() {
 	}
 }
 
+// CallTool 调用指定 MCP 服务端的工具。
 func (m *Manager) CallTool(
 	ctx context.Context,
 	serverName string,
