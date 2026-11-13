@@ -1,13 +1,11 @@
-
 {
   "mcpServers": {
     "filesystem": {
+      "transport": "stdio",
       "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "."
-      ]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "timeout": "30s",
+      "retry": 1
     }
   }
 }

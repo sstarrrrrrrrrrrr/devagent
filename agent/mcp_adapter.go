@@ -56,10 +56,19 @@ func buildMCPTools(
 			Description: mcpTool.Description,
 			Parameters:  parameters,
 
+			// Execute 闭包先检查 server 是否 alive，dead 时直接返回错误
+			// （CallTool 内部也会做连接级故障检测 + MarkDead）
 			Execute: func(
 				ctx context.Context,
 				args map[string]any,
 			) (string, error) {
+
+				if !manager.IsAlive(serverName) {
+					return "", fmt.Errorf(
+						"MCP 服务 %q 当前不可用，工具 %q 暂时无法使用",
+						serverName, originalToolName,
+					)
+				}
 
 				callResult, err := manager.CallTool(
 					ctx,

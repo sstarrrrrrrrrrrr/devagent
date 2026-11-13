@@ -14,6 +14,8 @@ var CurrentDirTool = Tool{
 		"properties": map[string]any{},
 		"required":   []string{},
 	},
+	// 纯元信息 → L0Safe
+	RiskLevel: L0Safe,
 	Execute: func(ctx context.Context, args map[string]any) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err

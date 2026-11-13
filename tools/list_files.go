@@ -21,6 +21,8 @@ var ListFilesTool = Tool{
 		},
 		"additionalProperties": false,
 	},
+	// 只读 + 路径沙箱 → L0Safe
+	RiskLevel: L0Safe,
 	Execute: func(ctx context.Context, args map[string]any) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err
