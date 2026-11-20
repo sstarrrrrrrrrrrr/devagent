@@ -320,7 +320,7 @@ func (a *Agent) hasDeadServers() bool {
 //   - pending != nil                  → 暂停，等用户确认 pending.Queue 里的工具调用
 //                                      （调用方处理完后应调 ResumeAgent）
 //
-// 四层终止保护：
+// 四层终止保护（实现见 modelLoop）：
 //  1. 系统提示词约束模型主动收口（见 instructions() 第 10 条）
 //  2. 同一工具+相同参数连续调用超过 maxRepeatToolCalls 次 → 熔断
 //  3. 总轮数达到 effectiveMaxRounds → 尝试提取模型已有的文字回答后返回
@@ -349,6 +349,70 @@ func (a *Agent) RunAgent(
 		return "", nil, fmt.Errorf("调用模型失败: %w", err)
 	}
 
+	st := a.modelLoop(ctx, s, resp)
+	switch st.outcome {
+	case loopDone:
+		return st.answer, nil, nil
+	case loopPending:
+		return "", st.pending, st.err
+	case loopMaxRounds:
+		return st.answer, nil, st.err
+	default:
+		return "", nil, st.err
+	}
+}
+
+// PendingQueue 是需要用户确认的工具调用队列。
+// Agent 返回给 TUI，TUI 弹框等用户逐个决策后调用 ResumeAgent。
+type PendingQueue struct {
+	Items []PendingItem
+}
+
+// PendingItem 是队列里的单个需要确认的工具调用。
+type PendingItem struct {
+	ToolName string
+	ArgsMap  map[string]any
+	Decision safety.Decision
+	ToolDesc string
+	// ToolCall 是已追加进 History 的 function_call 记录。
+	// 等用户决策后，ResumeAgent 会追加对应的 function_call_output。
+	ToolCall responses.ResponseInputItemUnionParam
+}
+
+// loopOutcome 是 modelLoop 的终止方式。
+type loopOutcome int
+
+const (
+	// loopDone 模型给出了最终文字回答（存在 loopState.answer）。
+	loopDone loopOutcome = iota
+	// loopPending 遇到需要用户确认的工具，暂停（存在 loopState.pending）。
+	loopPending
+	// loopMaxRounds 达到最大轮数，尝试用模型已有的文字兜底。
+	loopMaxRounds
+	// loopError 调用模型或熔断时出错（存在 loopState.err）。
+	loopError
+)
+
+// loopState 是 modelLoop 单次返回的完整状态。
+// History 已在 loop 内维护；answer/pending/err 按 outcome 填充。
+type loopState struct {
+	outcome loopOutcome
+	answer  string
+	pending *PendingQueue
+	err     error
+}
+
+// modelLoop 是 RunAgent / ResumeAgent 共用的模型-工具循环。
+//
+// 入参 resp 是已经拿到手的第一份模型响应；History 由本函数维护。
+// 每轮：解析 function_call → 熔断检查 → runTool 执行 → 遇确认暂停返回，
+// 否则把 tool_calls / tool_outputs 写进 History 后请求下一轮。
+// 达到 maxRounds 时用模型已有的文字回答兜底。
+func (a *Agent) modelLoop(
+	ctx context.Context,
+	s *session.Session,
+	resp *responses.Response,
+) loopState {
 	// 连续相同调用计数：只有「紧挨着的下一次调用」参数完全相同才累加，
 	// 避免模型在同一个任务里合法地多次调用同一工具时被误熔断。
 	lastSig := ""
@@ -373,10 +437,13 @@ func (a *Agent) RunAgent(
 				repeats = 1
 			}
 			if repeats >= maxRepeatToolCalls {
-				return "", nil, fmt.Errorf(
-					"检测到模型连续 %d 次以相同参数调用工具 %q，可能陷入循环，已停止执行",
-					repeats, item.Name,
-				)
+				return loopState{
+					outcome: loopError,
+					err: fmt.Errorf(
+						"检测到模型连续 %d 次以相同参数调用工具 %q，可能陷入循环，已停止执行",
+						repeats, item.Name,
+					),
+				}
 			}
 
 			result := runTool(ctx, item, a.toolExecutors, a.safetyGuard)
@@ -384,12 +451,11 @@ func (a *Agent) RunAgent(
 			if result.ToolName != "" {
 				// 需要用户确认 → 收集到 pending 队列
 				pendingItems = append(pendingItems, PendingItem{
-					ToolName:  result.ToolName,
-					ArgsJSON:  result.ArgsJSON,
-					ArgsMap:   result.ArgsMap,
-					Decision:  result.Decision,
-					ToolDesc:  result.ToolDesc,
-					ToolCall:  result.ToolCall,
+					ToolName: result.ToolName,
+					ArgsMap:  result.ArgsMap,
+					Decision: result.Decision,
+					ToolDesc: result.ToolDesc,
+					ToolCall: result.ToolCall,
 				})
 				// tool_call 先加进 History，tool_output 等用户决策后再加
 				toolCalls = append(toolCalls, result.ToolCall)
@@ -404,7 +470,7 @@ func (a *Agent) RunAgent(
 		if len(toolCalls) == 0 {
 			answer := resp.OutputText()
 			s.History = append(s.History, message("assistant", answer))
-			return answer, nil, nil
+			return loopState{outcome: loopDone, answer: answer}
 		}
 
 		// 有需要用户确认的工具 → 先暂停。
@@ -413,49 +479,43 @@ func (a *Agent) RunAgent(
 		if len(pendingItems) > 0 {
 			s.History = append(s.History, toolCalls...)
 			s.History = append(s.History, toolOutputs...)
-			return "", &PendingQueue{Items: pendingItems}, nil
+			return loopState{
+				outcome: loopPending,
+				pending: &PendingQueue{Items: pendingItems},
+			}
 		}
 
 		s.History = append(s.History, toolCalls...)
 		s.History = append(s.History, toolOutputs...)
 
-		params = a.buildModelParams(responses.ResponseNewParamsInputUnion{
+		params := a.buildModelParams(responses.ResponseNewParamsInputUnion{
 			OfInputItemList: s.History,
 		})
+		var err error
 		resp, err = a.client.Responses.New(ctx, params)
 		if err != nil {
-			return "", nil, fmt.Errorf("调用模型失败: %w", err)
+			return loopState{outcome: loopError, err: fmt.Errorf("调用模型失败: %w", err)}
 		}
 	}
 
+	// 达到最大轮数：模型若已有部分文字回答，返回它并附带提示错误
 	fallback := resp.OutputText()
 	if strings.TrimSpace(fallback) != "" {
 		s.History = append(s.History, message("assistant", fallback))
-		return fallback, nil, fmt.Errorf(
-			"达到最大工具调用轮数 %d，以上为模型已给出的部分回答",
-			maxRounds,
-		)
+		return loopState{
+			outcome: loopMaxRounds,
+			answer:  fallback,
+			err: fmt.Errorf(
+				"达到最大工具调用轮数 %d，以上为模型已给出的部分回答",
+				maxRounds,
+			),
+		}
 	}
 
-	return "", nil, fmt.Errorf("超过最大工具调用轮数 %d，停止执行", maxRounds)
-}
-
-// PendingQueue 是需要用户确认的工具调用队列。
-// Agent 返回给 TUI，TUI 弹框等用户逐个决策后调用 ResumeAgent。
-type PendingQueue struct {
-	Items []PendingItem
-}
-
-// PendingItem 是队列里的单个需要确认的工具调用。
-type PendingItem struct {
-	ToolName string
-	ArgsJSON string
-	ArgsMap  map[string]any
-	Decision safety.Decision
-	ToolDesc string
-	// ToolCall 是已追加进 History 的 function_call 记录。
-	// 等用户决策后，ResumeAgent 会追加对应的 function_call_output。
-	ToolCall responses.ResponseInputItemUnionParam
+	return loopState{
+		outcome: loopMaxRounds,
+		err:     fmt.Errorf("超过最大工具调用轮数 %d，停止执行", maxRounds),
+	}
 }
 
 // ResumeAgent 从暂停状态恢复执行。
@@ -484,19 +544,9 @@ func (a *Agent) ResumeAgent(
 	// 1. 根据用户决策执行（或跳过）pending 里的每个 item
 	var toolOutputs []responses.ResponseInputItemUnionParam
 	for i, item := range pending.Items {
-		decision := approved[i] // true=用户允许
-
-		if decision {
-			// 执行工具（ActionRequireConfirm 时 SafetyGuard 不会拦截，
-			// 因为 runTool 里在 Execute 之前就 return 了 pending，
-			// 这次直接调 tool.Execute 即可——但 Execute 里 SafetyGuard 还会再拦！
-			// 所以这里需要用原始工具的 Execute，而不是被包装过的。
-			// 简化处理：直接调 toolExecutors，SafetyGuard 会发现 ActionRequireConfirm
-			// 但这里我们是在用户确认后手动调的——有问题。
-			// 更好的方式是：SafetyGuard 包装的 Execute 加一个 "跳过确认" 参数。
-			// 当前实现用一个 hack：包装过的 Execute 调完还是会返回 ErrRequireConfirm，
-			// 因为 Decide 还是 RequireConfirm。所以用户确认后的执行需要另一条路径。
-			// 暂时 hack：在 Agent 里存原始工具 map，确认后直接 Execute 原始版本。
+		// true=用户允许。已确认的工具要用原始未包装版本执行：
+		// 包装版 Execute 会重新 Decide，ActionRequireConfirm 仍然返回 ErrRequireConfirm。
+		if approved[i] {
 			result, err := a.executeWithoutGuard(ctx, item.ToolName, item.ArgsMap)
 			if err != nil {
 				toolOutputs = append(toolOutputs, buildDirectOutput(item,
@@ -505,7 +555,6 @@ func (a *Agent) ResumeAgent(
 				toolOutputs = append(toolOutputs, buildDirectOutput(item, result))
 			}
 		} else {
-			// 用户拒绝
 			toolOutputs = append(toolOutputs, buildDirectOutput(item,
 				fmt.Sprintf("用户拒绝了此操作，原因: %s（风险等级 %s）",
 					item.Decision.Reason, item.Decision.RiskLevel.String())))
@@ -515,7 +564,7 @@ func (a *Agent) ResumeAgent(
 	// 2. 把 tool_outputs 追加进 History
 	s.History = append(s.History, toolOutputs...)
 
-	// 3. 继续模型循环（和 RunAgent 里的逻辑几乎一样，只是不重复同步 MCP 状态）
+	// 3. 请求模型并继续共用循环
 	params := a.buildModelParams(responses.ResponseNewParamsInputUnion{
 		OfInputItemList: s.History,
 	})
@@ -524,86 +573,17 @@ func (a *Agent) ResumeAgent(
 		return "", nil, fmt.Errorf("调用模型失败: %w", err)
 	}
 
-	// 连续相同调用计数，判定规则与 RunAgent 一致
-	lastSig := ""
-	repeats := 0
-	maxRounds := a.effectiveMaxRounds()
-
-	for round := 1; round <= maxRounds; round++ {
-		var toolCalls []responses.ResponseInputItemUnionParam
-		var toolOutputs []responses.ResponseInputItemUnionParam
-		var pendingItems []PendingItem
-
-		for _, item := range resp.Output {
-			if item.Type != "function_call" {
-				continue
-			}
-
-			sig := item.Name + "|" + item.Arguments.OfString
-			if sig == lastSig {
-				repeats++
-			} else {
-				lastSig = sig
-				repeats = 1
-			}
-			if repeats >= maxRepeatToolCalls {
-				return "", nil, fmt.Errorf(
-					"检测到模型连续 %d 次以相同参数调用工具 %q，可能陷入循环",
-					repeats, item.Name,
-				)
-			}
-
-			result := runTool(ctx, item, a.toolExecutors, a.safetyGuard)
-
-			if result.ToolName != "" {
-				pendingItems = append(pendingItems, PendingItem{
-					ToolName:  result.ToolName,
-					ArgsJSON:  result.ArgsJSON,
-					ArgsMap:   result.ArgsMap,
-					Decision:  result.Decision,
-					ToolDesc:  result.ToolDesc,
-					ToolCall:  result.ToolCall,
-				})
-				toolCalls = append(toolCalls, result.ToolCall)
-				continue
-			}
-
-			toolCalls = append(toolCalls, result.ToolCall)
-			toolOutputs = append(toolOutputs, result.ToolOutput)
-		}
-
-		if len(toolCalls) == 0 {
-			answer := resp.OutputText()
-			s.History = append(s.History, message("assistant", answer))
-			return answer, nil, nil
-		}
-
-		// 同 RunAgent：已执行工具的 output 也要写入，避免 function_call 缺 output
-		if len(pendingItems) > 0 {
-			s.History = append(s.History, toolCalls...)
-			s.History = append(s.History, toolOutputs...)
-			return "", &PendingQueue{Items: pendingItems}, nil
-		}
-
-		s.History = append(s.History, toolCalls...)
-		s.History = append(s.History, toolOutputs...)
-
-		params = a.buildModelParams(responses.ResponseNewParamsInputUnion{
-			OfInputItemList: s.History,
-		})
-		resp, err = a.client.Responses.New(ctx, params)
-		if err != nil {
-			return "", nil, fmt.Errorf("调用模型失败: %w", err)
-		}
+	st := a.modelLoop(ctx, s, resp)
+	switch st.outcome {
+	case loopDone:
+		return st.answer, nil, nil
+	case loopPending:
+		return "", st.pending, st.err
+	case loopMaxRounds:
+		return st.answer, nil, st.err
+	default:
+		return "", nil, st.err
 	}
-
-	fallback := resp.OutputText()
-	if strings.TrimSpace(fallback) != "" {
-		s.History = append(s.History, message("assistant", fallback))
-		return fallback, nil, fmt.Errorf("达到最大轮数，以上为模型已给出的部分回答")
-	}
-
-	return "", nil, fmt.Errorf("超过最大工具调用轮数 %d，停止执行", maxRounds)
 }
 
 // executeWithoutGuard 跳过 SafetyGuard 执行原始工具。

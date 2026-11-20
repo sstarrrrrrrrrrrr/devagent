@@ -24,11 +24,10 @@ type RunResult struct {
 	ToolOutput responses.ResponseInputItemUnionParam
 
 	// 需要用户确认时填充以下字段：
-	ToolName  string
-	ArgsJSON  string
-	ArgsMap   map[string]any
-	Decision  safety.Decision
-	ToolDesc  string
+	ToolName string
+	ArgsMap  map[string]any
+	Decision safety.Decision
+	ToolDesc string
 }
 
 // runTool 执行模型请求的工具。
@@ -67,13 +66,12 @@ func runTool(
 		if decision.Action == safety.ActionRequireConfirm {
 			// 暂停，等用户决策
 			return RunResult{
-				ToolCall:  buildToolCall(item),
+				ToolCall:   buildToolCall(item),
 				ToolOutput: buildToolOutput(item, ""), // 占位，还没执行
-				ToolName:  item.Name,
-				ArgsJSON:  item.Arguments.OfString,
-				ArgsMap:   args,
-				Decision:  decision,
-				ToolDesc:  tool.Description,
+				ToolName:   item.Name,
+				ArgsMap:    args,
+				Decision:   decision,
+				ToolDesc:   tool.Description,
 			}
 		}
 	}
@@ -88,13 +86,12 @@ func runTool(
 		if errors.Is(err, safety.ErrRequireConfirm) {
 			decision := safetyGuard.Decide(tool, args)
 			return RunResult{
-				ToolCall:  buildToolCall(item),
+				ToolCall:   buildToolCall(item),
 				ToolOutput: buildToolOutput(item, ""),
-				ToolName:  item.Name,
-				ArgsJSON:  item.Arguments.OfString,
-				ArgsMap:   args,
-				Decision:  decision,
-				ToolDesc:  tool.Description,
+				ToolName:   item.Name,
+				ArgsMap:    args,
+				Decision:   decision,
+				ToolDesc:   tool.Description,
 			}
 		}
 		result = fmt.Sprintf("工具执行失败: %v", err)
