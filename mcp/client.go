@@ -116,21 +116,6 @@ func (m *Manager) DeadServers() []string {
 	return names
 }
 
-// AliveToolNames 返回所有 alive server 的 MCP 工具名集合。
-// Agent 用这个来动态过滤 system prompt 里的工具列表。
-func (m *Manager) AliveToolNames() map[string]bool {
-	result := make(map[string]bool)
-	for name, alive := range m.serverAlive {
-		if !alive {
-			continue
-		}
-		for _, t := range m.serverTools[name] {
-			result[t.Name] = true
-		}
-	}
-	return result
-}
-
 // closeSessionWithTimeout 在独立 goroutine 里 Close session，给 5s 超时。
 //
 // session.Close 底层可能阻塞（比如 SSE 的 HTTP 连接还挂着没法优雅关闭，

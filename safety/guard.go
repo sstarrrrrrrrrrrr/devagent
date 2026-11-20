@@ -17,15 +17,6 @@ import (
 // Agent 的 runTool 捕获后暂停执行，把工具信息交给 TUI 弹窗。
 var ErrRequireConfirm = errors.New("安全策略要求用户确认后才能执行")
 
-// PendingConfirm 是需要人机协作时传递的完整信息。
-// Agent 把它交给 TUI，TUI 弹框展示后等用户决策。
-type PendingConfirm struct {
-	ToolName  string
-	Arguments map[string]any
-	Decision  Decision
-	ToolDesc  string // 工具描述（展示给用户看）
-}
-
 // Action 是 SafetyGuard.Decide() 对一次工具调用的决策。
 // 只有三种，语义绝对清晰：
 type Action int
@@ -548,15 +539,4 @@ func WrapAllTools(tools []projecttools.Tool, guard *SafetyGuard) []projecttools.
 		result[i] = wrapWithSafetyGuard(tool, guard)
 	}
 	return result
-}
-
-// ---- context 辅助 ----
-
-const maxArgStringLen = 200
-
-func truncateForLog(s string) string {
-	if len(s) <= maxArgStringLen {
-		return s
-	}
-	return s[:maxArgStringLen] + fmt.Sprintf("...(截断，总长度 %d)", len(s))
 }
