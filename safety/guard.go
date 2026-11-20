@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -97,8 +98,9 @@ func NewSafetyGuard(config *SafetyConfig, workdir string) (*SafetyGuard, error) 
 //  3. Blocklist.CommandPatterns 命中 → Blocked
 //  4. Whitelist.Tools 命中 → Allow（跳过所有后续检查）
 //  5. Whitelist.Paths 命中 → Allow
-//  6. RiskOverrides 覆盖 tool.RiskLevel → 升级或降级
-//  7. tool.RiskLevel 本身 → 映射到 Allow / RequireConfirm
+//  6. RiskOverrides 命中 → 使用用户配置的等级
+//  7. 按工具语义自动分类：只读（目录内）→ L0；目录外读取 → L1；
+//     写入 / 删除 / 执行 → L2；无法识别 → L1
 //  8. 兜底 DefaultRisk
 func (g *SafetyGuard) Decide(tool projecttools.Tool, args map[string]any) Decision {
 	// ---- 第 1 层：Blocklist → 直接 Block ----
@@ -146,42 +148,223 @@ func (g *SafetyGuard) Decide(tool projecttools.Tool, args map[string]any) Decisi
 		}
 	}
 
-	// ---- 第 3 层：RiskOverrides 覆盖 ----
+	// ---- 第 3 层：RiskOverrides 覆盖（用户显式配置优先） ----
 	effectiveLevel := tool.RiskLevel
+	reason := ""
+	overridden := false
 	for pattern, riskStr := range g.config.RiskOverrides {
 		if matchGlob(tool.Name, pattern) {
 			if level, ok := parseRiskLevel(riskStr); ok {
 				effectiveLevel = level
+				overridden = true
+				reason = fmt.Sprintf("匹配 riskOverrides 规则 %q", pattern)
 			}
 		}
 	}
 
-	// ---- 第 4 层：兜底 RiskLevel ----
-	if effectiveLevel == 0 {
-		if g.config.DefaultRisk != "" {
-			if level, ok := parseRiskLevel(g.config.DefaultRisk); ok {
-				effectiveLevel = level
-			} else {
-				effectiveLevel = projecttools.L1Confirm
-			}
-		} else {
-			effectiveLevel = projecttools.L1Confirm
-		}
+	// ---- 第 4 层：按工具语义自动分类 ----
+	// 没有显式覆盖时，按「读取 / 写入 / 删除 / 执行」判断风险，
+	// 避免把只读工具也当成需要确认的操作。
+	if !overridden {
+		effectiveLevel, reason = g.autoClassify(tool, args)
 	}
 
 	// ---- 第 5 层：RiskLevel → Action（三态映射） ----
+	// 注意：L0Safe 的数值就是 0，不能用 effectiveLevel == 0 判断
+	// 「等级未设置」，否则会把只读工具的 L0 误判成兜底等级。
+	if reason == "" {
+		reason = defaultReason(effectiveLevel)
+	}
+
 	switch effectiveLevel {
 	case projecttools.L0Safe:
-		return Decision{Action: ActionAllow, Reason: "L0-Safe，直接放行", RiskLevel: effectiveLevel}
+		return Decision{Action: ActionAllow, Reason: reason, RiskLevel: effectiveLevel}
 	case projecttools.L1Confirm:
-		return Decision{Action: ActionRequireConfirm, Reason: "L1-Confirm，需要用户确认", RiskLevel: effectiveLevel}
+		return Decision{Action: ActionRequireConfirm, Reason: reason, RiskLevel: effectiveLevel}
 	case projecttools.L2Review:
-		return Decision{Action: ActionRequireConfirm, Reason: "L2-Review，需要用户审核", RiskLevel: effectiveLevel}
+		return Decision{Action: ActionRequireConfirm, Reason: reason, RiskLevel: effectiveLevel}
 	case projecttools.L3Blocked:
-		return Decision{Action: ActionBlock, Reason: "L3-Blocked，禁止执行", RiskLevel: effectiveLevel}
+		return Decision{Action: ActionBlock, Reason: reason, RiskLevel: effectiveLevel}
 	default:
 		return Decision{Action: ActionRequireConfirm, Reason: "未知等级，默认需要确认", RiskLevel: projecttools.L1Confirm}
 	}
+}
+
+// defaultReason 返回风险等级的默认说明。
+func defaultReason(level projecttools.RiskLevel) string {
+	switch level {
+	case projecttools.L0Safe:
+		return "L0-Safe，直接放行"
+	case projecttools.L1Confirm:
+		return "L1-Confirm，需要用户确认"
+	case projecttools.L2Review:
+		return "L2-Review，需要用户审核"
+	case projecttools.L3Blocked:
+		return "L3-Blocked，禁止执行"
+	default:
+		return "未知风险等级"
+	}
+}
+
+// toolKind 是工具语义分类。
+type toolKind int
+
+const (
+	toolKindUnknown toolKind = iota
+	toolKindRead
+	toolKindWrite
+	toolKindDestroy
+	toolKindExec
+)
+
+// 工具名关键词表。判断顺序：删除 > 执行 > 写入 > 读取。
+// 名称匹配不区分大小写，MCP 工具的完整名形如 mcp_<server>_<tool>，直接子串匹配即可。
+var (
+	destroyKeywords = []string{
+		"delete", "remove", "unlink", "truncate", "drop", "destroy",
+		"wipe", "purge", "rmdir", "kill", "clear",
+	}
+	execKeywords = []string{
+		"exec", "shell", "bash", "powershell", "terminal", "spawn",
+		"command", "cmd", "process", "run",
+	}
+	writeKeywords = []string{
+		"write", "create", "edit", "replace", "append", "patch", "update",
+		"mkdir", "move", "rename", "copy", "chmod", "chown", "symlink",
+		"upload", "push", "deploy", "publish", "commit", "merge",
+	}
+	readKeywords = []string{
+		"read", "get", "list", "search", "find", "stat", "info", "view",
+		"cat", "tree", "glob", "grep", "diff", "describe", "query",
+		"fetch", "download", "open", "head", "tail", "exists", "count",
+	}
+)
+
+// classifyTool 根据工具名推断语义类别。
+func classifyTool(name string) toolKind {
+	n := strings.ToLower(name)
+
+	for _, k := range destroyKeywords {
+		if strings.Contains(n, k) {
+			return toolKindDestroy
+		}
+	}
+	for _, k := range execKeywords {
+		if strings.Contains(n, k) {
+			return toolKindExec
+		}
+	}
+	for _, k := range writeKeywords {
+		if strings.Contains(n, k) {
+			return toolKindWrite
+		}
+	}
+	for _, k := range readKeywords {
+		if strings.Contains(n, k) {
+			return toolKindRead
+		}
+	}
+	return toolKindUnknown
+}
+
+// autoClassify 按工具语义 + 参数路径自动推断风险等级。
+//
+// 关键规则：
+//   - 只读工具访问工作目录内 → L0 直接放行（看自己项目的代码不需要确认）
+//   - 只读工具访问工作目录外 → L1 需要确认（不该看的文件要看一眼）
+//   - 写入 / 删除 / 命令执行 → L2 需要审核
+//   - 无法识别的工具 → L1 保守确认
+//   - 工具自己声明了 L2/L3 时作为风险下界，关键词推断不能把它降级
+//
+// 注意 L0/L1 的声明不作为下界：MCP 工具统一被标记为 L1Confirm 占位，
+// 若当成下界会让只读工具重新变成需要确认。
+func (g *SafetyGuard) autoClassify(tool projecttools.Tool, args map[string]any) (projecttools.RiskLevel, string) {
+	level, reason := g.classifyBySemantics(tool, args)
+
+	if tool.RiskLevel >= projecttools.L2Review && tool.RiskLevel > level {
+		return tool.RiskLevel, fmt.Sprintf("工具声明的风险等级为 %s，按该等级处理", tool.RiskLevel)
+	}
+	return level, reason
+}
+
+// classifyBySemantics 只按工具名语义和参数路径推断等级。
+func (g *SafetyGuard) classifyBySemantics(tool projecttools.Tool, args map[string]any) (projecttools.RiskLevel, string) {
+	switch classifyTool(tool.Name) {
+	case toolKindRead:
+		if outside := g.pathsOutsideWorkdir(args); len(outside) > 0 {
+			return projecttools.L1Confirm, fmt.Sprintf(
+				"只读工具要访问工作目录之外的文件 %q，需要确认", outside[0])
+		}
+		return projecttools.L0Safe, "只读工具且路径都在工作目录内，直接放行"
+
+	case toolKindWrite:
+		return projecttools.L2Review, "写操作（新增/修改文件），需要审核"
+
+	case toolKindDestroy:
+		return projecttools.L2Review, "删除或破坏性操作，需要审核"
+
+	case toolKindExec:
+		return projecttools.L2Review, "命令执行，需要审核"
+
+	default:
+		if g.config.DefaultRisk != "" {
+			if level, ok := parseRiskLevel(g.config.DefaultRisk); ok {
+				return level, "未识别的工具，使用配置的默认等级"
+			}
+		}
+		return projecttools.L1Confirm, "工具用途未知，需要确认"
+	}
+}
+
+// isPathArg 判断参数名是否表示路径。
+func isPathArg(name string) bool {
+	n := strings.ToLower(name)
+	for _, k := range []string{
+		"path", "file", "dir", "folder", "target", "source", "root", "location",
+	} {
+		if strings.Contains(n, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathsOutsideWorkdir 返回参数里落在工作目录之外的路径。
+func (g *SafetyGuard) pathsOutsideWorkdir(args map[string]any) []string {
+	if g.workdir == "" {
+		return nil
+	}
+	wd, err := filepath.Abs(g.workdir)
+	if err != nil {
+		return nil
+	}
+
+	var outside []string
+	for name, value := range args {
+		if !isPathArg(name) {
+			continue
+		}
+		s, ok := value.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			continue
+		}
+
+		p := s
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(wd, p)
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			outside = append(outside, s)
+			continue
+		}
+
+		rel, err := filepath.Rel(wd, abs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			outside = append(outside, s)
+		}
+	}
+	return outside
 }
 
 // ---- 匹配辅助方法 ----
@@ -251,24 +434,45 @@ func matchGlob(name, pattern string) bool {
 }
 
 // matchPathGlob 测试 path 是否匹配 pattern。
-// 先做平台归一化（Windows \ → /），再做 filepath.Match。
+//
+// 处理要点：
+//   - Windows 反斜杠归一化为 /
+//   - ~ 展开为用户主目录
+//   - 大小写不敏感（Windows 文件系统语义）
+//   - 目录模式 "dir/*" 命中 dir 本身及其下任意层级
+//   - 不做「子串包含」匹配，否则 "/dev/*" 会误伤 "D:/code/.../devagent"
 func matchPathGlob(path, pattern string) bool {
-	path = strings.ReplaceAll(path, "\\", "/")
-	pattern = strings.ReplaceAll(pattern, "\\", "/")
+	path = strings.ToLower(normalizeMatchPath(path))
+	pattern = strings.ToLower(normalizeMatchPath(pattern))
 
-	if strings.HasPrefix(path, "~") {
-		path = path[1:]
-	}
-	if strings.HasPrefix(pattern, "~") {
-		pattern = pattern[1:]
-	}
-
-	ok, err := filepath.Match(pattern, path)
-	if err == nil && ok {
+	if ok, err := filepath.Match(pattern, path); err == nil && ok {
 		return true
 	}
 
-	return strings.Contains(path, strings.TrimSuffix(strings.TrimPrefix(pattern, "*/"), "/*"))
+	if strings.HasSuffix(pattern, "/*") {
+		dir := strings.TrimSuffix(pattern, "/*")
+		if path == dir || strings.HasPrefix(path, dir+"/") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// normalizeMatchPath 统一路径分隔符并展开 ~。
+func normalizeMatchPath(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	p = strings.ReplaceAll(p, "//", "/")
+
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			home = strings.ReplaceAll(home, "\\", "/")
+			home = strings.ReplaceAll(home, "//", "/")
+			p = strings.TrimSuffix(home, "/") + p[1:]
+		}
+	}
+
+	return p
 }
 
 // parseRiskLevel 解析 risk level 字符串（大小写不敏感）。

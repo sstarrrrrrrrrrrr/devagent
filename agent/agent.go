@@ -7,9 +7,12 @@ import (
 	"devagent/session"
 	"devagent/tools"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -41,6 +44,72 @@ type Agent struct {
 
 	// MaxToolRounds 单次对话中工具调用的最大轮数。
 	MaxToolRounds int
+}
+
+// newHTTPClient 构造带并发拨号的 HTTP 客户端。
+//
+// 背景：api.deepseek.com 会解析出多个 A 记录，本机上部分 IP 的 TCP 建连会
+// 静默挂起 20s 以上。Go 默认按顺序逐个拨号，于是第一个请求要等前一个 IP
+// 超时后才落到可用 IP，表现为「第一次回复特别慢」（约 16s；之后复用了
+// 连接所以就快了）。
+//
+// 这里改成对每个 IP 并发拨号，谁先连通用谁，把首次请求收敛到几秒内。
+func newHTTPClient() *http.Client {
+	dialer := &net.Dialer{KeepAlive: 30 * time.Second}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return dialer.DialContext(ctx, network, addr)
+			}
+
+			ips, err := net.DefaultResolver.LookupHost(ctx, host)
+			if err != nil || len(ips) == 0 {
+				return dialer.DialContext(ctx, network, addr)
+			}
+
+			type dialResult struct {
+				conn net.Conn
+				err  error
+			}
+
+			dialCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			results := make(chan dialResult, len(ips))
+			for _, ip := range ips {
+				go func(ip string) {
+					conn, err := dialer.DialContext(dialCtx, network, net.JoinHostPort(ip, port))
+					results <- dialResult{conn: conn, err: err}
+				}(ip)
+			}
+
+			var firstErr error
+			for i := 0; i < len(ips); i++ {
+				r := <-results
+				if r.err == nil {
+					cancel() // 让其余还在拨号的 goroutine 尽快退出
+					return r.conn, nil
+				}
+				if firstErr == nil {
+					firstErr = r.err
+				}
+			}
+			return nil, firstErr
+		},
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   3 * time.Minute,
+	}
 }
 
 // NewAgent 创建 Agent，连接 MCP 并注册工具。
@@ -158,6 +227,7 @@ func NewAgent() (*Agent, error) {
 		client: openai.NewClient(
 			option.WithAPIKey(apiKey),
 			option.WithBaseURL("https://api.deepseek.com"),
+			option.WithHTTPClient(newHTTPClient()),
 		),
 
 		openAITools:      openAITools,
@@ -214,6 +284,12 @@ func (a *Agent) refreshTools() {
 		allTools = append(allTools, converted...)
 	}
 
+	// 保存一份未包装的工具，供用户确认后直接执行（跳过安全拦截）
+	rawExecutors := make(map[string]tools.Tool, len(allTools))
+	for _, t := range allTools {
+		rawExecutors[t.Name] = t
+	}
+
 	// 所有工具统一经过安全拦截器包装
 	allTools = safety.WrapAllTools(allTools, a.safetyGuard)
 
@@ -226,6 +302,7 @@ func (a *Agent) refreshTools() {
 
 	a.toolExecutors = executors
 	a.openAITools = openAITools
+	a.rawToolExecutors = rawExecutors
 }
 
 // hasDeadServers 判断 Manager 当前是否有任何 dead server。
@@ -272,7 +349,10 @@ func (a *Agent) RunAgent(
 		return "", nil, fmt.Errorf("调用模型失败: %w", err)
 	}
 
-	recentToolCalls := make(map[string]int)
+	// 连续相同调用计数：只有「紧挨着的下一次调用」参数完全相同才累加，
+	// 避免模型在同一个任务里合法地多次调用同一工具时被误熔断。
+	lastSig := ""
+	repeats := 0
 	maxRounds := a.effectiveMaxRounds()
 
 	for round := 1; round <= maxRounds; round++ {
@@ -286,11 +366,16 @@ func (a *Agent) RunAgent(
 			}
 
 			sig := item.Name + "|" + item.Arguments.OfString
-			recentToolCalls[sig]++
-			if recentToolCalls[sig] >= maxRepeatToolCalls {
+			if sig == lastSig {
+				repeats++
+			} else {
+				lastSig = sig
+				repeats = 1
+			}
+			if repeats >= maxRepeatToolCalls {
 				return "", nil, fmt.Errorf(
 					"检测到模型连续 %d 次以相同参数调用工具 %q，可能陷入循环，已停止执行",
-					maxRepeatToolCalls, item.Name,
+					repeats, item.Name,
 				)
 			}
 
@@ -322,13 +407,13 @@ func (a *Agent) RunAgent(
 			return answer, nil, nil
 		}
 
-		// 有需要用户确认的工具 → 先暂停，不追加 History（ToolCall 加了，ToolOutput 没加）
+		// 有需要用户确认的工具 → 先暂停。
+		// 注意：本轮已执行的工具（ActionAllow）的 tool_output 也必须写入 History，
+		// 否则这些 function_call 会永远缺少对应 output，恢复后请求模型会报错。
 		if len(pendingItems) > 0 {
 			s.History = append(s.History, toolCalls...)
-			return "", &PendingQueue{
-				Items:  pendingItems,
-				History: s.History,
-			}, nil
+			s.History = append(s.History, toolOutputs...)
+			return "", &PendingQueue{Items: pendingItems}, nil
 		}
 
 		s.History = append(s.History, toolCalls...)
@@ -359,8 +444,6 @@ func (a *Agent) RunAgent(
 // Agent 返回给 TUI，TUI 弹框等用户逐个决策后调用 ResumeAgent。
 type PendingQueue struct {
 	Items []PendingItem
-	// History 是当前 session 的 History 快照，ResumeAgent 会基于它继续。
-	History []responses.ResponseInputItemUnionParam
 }
 
 // PendingItem 是队列里的单个需要确认的工具调用。
@@ -390,6 +473,12 @@ func (a *Agent) ResumeAgent(
 ) (string, *PendingQueue, error) {
 	if pending == nil {
 		return "", nil, fmt.Errorf("没有待恢复的 pending 队列")
+	}
+	if len(approved) != len(pending.Items) {
+		return "", nil, fmt.Errorf(
+			"用户决策数量 %d 与待确认工具数量 %d 不一致",
+			len(approved), len(pending.Items),
+		)
 	}
 
 	// 1. 根据用户决策执行（或跳过）pending 里的每个 item
@@ -435,7 +524,9 @@ func (a *Agent) ResumeAgent(
 		return "", nil, fmt.Errorf("调用模型失败: %w", err)
 	}
 
-	recentToolCalls := make(map[string]int)
+	// 连续相同调用计数，判定规则与 RunAgent 一致
+	lastSig := ""
+	repeats := 0
 	maxRounds := a.effectiveMaxRounds()
 
 	for round := 1; round <= maxRounds; round++ {
@@ -449,11 +540,16 @@ func (a *Agent) ResumeAgent(
 			}
 
 			sig := item.Name + "|" + item.Arguments.OfString
-			recentToolCalls[sig]++
-			if recentToolCalls[sig] >= maxRepeatToolCalls {
+			if sig == lastSig {
+				repeats++
+			} else {
+				lastSig = sig
+				repeats = 1
+			}
+			if repeats >= maxRepeatToolCalls {
 				return "", nil, fmt.Errorf(
 					"检测到模型连续 %d 次以相同参数调用工具 %q，可能陷入循环",
-					maxRepeatToolCalls, item.Name,
+					repeats, item.Name,
 				)
 			}
 
@@ -482,12 +578,11 @@ func (a *Agent) ResumeAgent(
 			return answer, nil, nil
 		}
 
+		// 同 RunAgent：已执行工具的 output 也要写入，避免 function_call 缺 output
 		if len(pendingItems) > 0 {
 			s.History = append(s.History, toolCalls...)
-			return "", &PendingQueue{
-				Items:  pendingItems,
-				History: s.History,
-			}, nil
+			s.History = append(s.History, toolOutputs...)
+			return "", &PendingQueue{Items: pendingItems}, nil
 		}
 
 		s.History = append(s.History, toolCalls...)

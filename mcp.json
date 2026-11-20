@@ -6,6 +6,16 @@
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
       "timeout": "30s",
       "retry": 1
+    },
+    "github": {
+      "transport": "streamable",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      },
+      "timeout": "30s",
+      "callTimeout": "60s",
+      "retry": 2
     }
   }
 }

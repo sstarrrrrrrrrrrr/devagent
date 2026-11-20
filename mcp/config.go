@@ -14,8 +14,9 @@ type Config struct {
 
 // 支持的传输类型。
 const (
-	TransportStdio = "stdio"
-	TransportSSE   = "sse"
+	TransportStdio      = "stdio"
+	TransportSSE        = "sse"
+	TransportStreamable = "streamable"
 )
 
 // ServerConfig 描述一个 MCP Server 的连接方式。
@@ -23,8 +24,9 @@ const (
 // 根据 Transport 字段选择不同的子配置：
 //   - "stdio"（默认）：Command + Args + Env，本地起子进程走 stdin/stdout
 //   - "sse"：URL + Headers，连接远程 SSE 服务端
+//   - "streamable"：URL + Headers，连接 Streamable HTTP 服务端（MCP 2025-03 规范）
 type ServerConfig struct {
-	// Transport 决定传输方式，留空或 "stdio" 为子进程模式，"sse" 为远程 SSE。
+	// Transport 决定传输方式，留空或 "stdio" 为子进程模式，"sse"/"streamable" 为远程 HTTP。
 	Transport string `json:"transport,omitempty"`
 
 	// ---- stdio 专用字段 ----
@@ -32,8 +34,8 @@ type ServerConfig struct {
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 
-	// ---- sse 专用字段 ----
-	URL     string           `json:"url,omitempty"`
+	// ---- sse / streamable 专用字段 ----
+	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 
 	// ---- 通用可选字段 ----
@@ -96,6 +98,15 @@ func (s ServerConfig) GetCallTimeout() time.Duration {
 	return 60 * time.Second
 }
 
+// expandEnvRefs 把字符串里的 ${VAR} 替换为对应环境变量值。
+// 用于让 token 类敏感信息走环境变量而不是明文写进配置文件。
+// 未设置的环境变量替换为空串，保持配置可用（连接时再由服务端拒绝）。
+func expandEnvRefs(s string) string {
+	return os.Expand(s, func(key string) string {
+		return os.Getenv(key)
+	})
+}
+
 // LoadConfig 从 JSON 文件中读取 MCP 配置并校验。
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -113,9 +124,14 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	for name, server := range config.MCPServers {
+		// headers 里的值支持 ${VAR} 引用环境变量（如 Authorization: "Bearer ${GITHUB_TOKEN}"）
+		for key, value := range server.Headers {
+			server.Headers[key] = expandEnvRefs(value)
+		}
 		if err := validateServer(name, server); err != nil {
 			return nil, err
 		}
+		config.MCPServers[name] = server
 	}
 
 	return &config, nil
@@ -132,9 +148,13 @@ func validateServer(name string, server ServerConfig) error {
 		if server.URL == "" {
 			return fmt.Errorf("MCP 服务 %q (sse) 缺少 url 字段", name)
 		}
+	case TransportStreamable:
+		if server.URL == "" {
+			return fmt.Errorf("MCP 服务 %q (streamable) 缺少 url 字段", name)
+		}
 	default:
-		return fmt.Errorf("MCP 服务 %q 使用了未知传输类型 %q，支持: %s, %s",
-			name, server.Transport, TransportStdio, TransportSSE)
+		return fmt.Errorf("MCP 服务 %q 使用了未知传输类型 %q，支持: %s, %s, %s",
+			name, server.Transport, TransportStdio, TransportSSE, TransportStreamable)
 	}
 	return nil
 }

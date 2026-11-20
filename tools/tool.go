@@ -63,9 +63,11 @@ func (t Tool) ToOpenAITool() responses.ToolUnionParam {
 }
 
 // All 是 Agent 使用的本地工具集合，新增本地工具时在这里登记。
-// 所有本地工具当前都是只读的，统一标记为 L0Safe。
+// 除 run_command 外都是只读的 L0Safe；run_command 是执行类 L2Review，
+// 由 SafetyGuard 强制走用户审核。
 var All = []Tool{
 	ReadFileTool,
 	CurrentDirTool,
 	ListFilesTool,
+	RunCommandTool,
 }

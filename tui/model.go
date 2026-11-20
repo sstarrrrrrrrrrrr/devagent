@@ -5,7 +5,10 @@ import (
 	"devagent/agent"
 	"devagent/session"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -80,8 +83,10 @@ type Model struct {
 	session     *session.Session
 	messages    []chatMessage
 	busy        bool
+	busySince   time.Time // 本次等待开始时间，用于在状态栏展示耗时
 	width       int
 	height      int
+	workdir     string // 工作目录，用于把绝对路径显示成相对路径
 	ready       bool
 
 	// pending 人机协作暂停状态
@@ -116,6 +121,8 @@ func NewModel() (Model, error) {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 
+	workdir, _ := os.Getwd()
+
 	return Model{
 		input:    input,
 		viewport: viewport.New(),
@@ -123,6 +130,7 @@ func NewModel() (Model, error) {
 		agent:    a,
 		session:  session.NewSession(),
 		messages: []chatMessage{},
+		workdir:  workdir,
 	}, nil
 }
 
@@ -178,6 +186,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages = append(m.messages, chatMessage{role: "user", content: prompt})
 			m.input.Reset()
 			m.busy = true
+			m.busySince = time.Now()
 			m.refreshViewport()
 			return m, tea.Batch(
 				askAgentCmd(m.agent, m.session, prompt),
@@ -190,6 +199,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
 		}
+
+	case tea.MouseClickMsg:
+		// 确认弹框模式下，点击选项行等同于按对应按键
+		if m.pending != nil && m.currentPending < len(m.pending.Items) {
+			if updated, cmd, handled := m.handleConfirmClick(msg.X, msg.Y); handled {
+				return updated, cmd
+			}
+		}
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
 
 	case tea.MouseMsg:
 		var cmd tea.Cmd
@@ -226,6 +246,7 @@ func (m Model) handleAgentResult(msg agentResultMsg) (tea.Model, tea.Cmd) {
 		m.pending = msg.pending
 		m.currentPending = 0
 		m.approvals = nil // 每次新的 pause 重置
+		m.refreshViewport()
 		return m, nil
 	}
 
@@ -299,6 +320,7 @@ func (m Model) confirmCurrent(approved bool, advance bool) (tea.Model, tea.Cmd) 
 		if m.currentPending >= len(m.pending.Items) {
 			// 所有 item 都审核完了 → 恢复 Agent
 			m.busy = true // ResumeAgent 可能要花点时间，显示 spinner
+			m.busySince = time.Now()
 			return m, tea.Batch(
 				resumeAgentCmd(m.agent, m.session, m.pending, m.approvals),
 				m.spinner.Tick,
@@ -326,6 +348,7 @@ func (m Model) confirmAll(approved bool) (tea.Model, tea.Cmd) {
 		m.currentPending++
 	}
 	m.busy = true
+	m.busySince = time.Now()
 	m.refreshViewport()
 	return m, tea.Batch(
 		resumeAgentCmd(m.agent, m.session, m.pending, m.approvals),
@@ -334,17 +357,33 @@ func (m Model) confirmAll(approved bool) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) resizeViewport() {
-	h := m.height - 2
+	m.viewport.SetWidth(m.width)
+	m.viewport.SetHeight(m.viewportHeight())
+	m.viewport.SoftWrap = true
+	if m.width > 0 && m.height > 0 {
+		m.ready = true
+	}
+}
+
+// viewportHeight 计算消息区可用高度。
+// 底部固定区域在普通模式是「状态栏 + 输入框」两行；
+// 人机协作模式则要扣掉确认弹框，否则弹框会被挤出屏幕（只剩一条上边框）。
+func (m Model) viewportHeight() int {
+	footer := 2
+	if m.pending != nil && m.currentPending < len(m.pending.Items) {
+		lines, _ := confirmBoxLines(m)
+		footer = len(lines) + 1 // 弹框 + 状态栏
+	}
+
+	h := m.height - footer
 	if h < 1 {
 		h = 1
 	}
-	m.viewport.SetWidth(m.width)
-	m.viewport.SetHeight(h)
-	m.viewport.SoftWrap = true
-	m.ready = true
+	return h
 }
 
 func (m *Model) refreshViewport() {
+	m.resizeViewport()
 	m.viewport.SetContent(renderMessages(m.messages))
 	m.viewport.GotoBottom()
 }
@@ -606,14 +645,15 @@ func renderTableBlock(b *strings.Builder, block mdBlock) {
 		dataRows = append(dataRows, cells)
 	}
 
-	// 计算每列最大可见宽度（用纯文本，不含 ANSI 码）
+	// 计算每列最大可见宽度（用纯文本，不含 ANSI 码）。
+	// 必须按终端显示宽度算，中文占两列，按 rune 数算会错位。
 	colWidths := make([]int, colCount)
 	for i, h := range header {
-		colWidths[i] = runeLen(h)
+		colWidths[i] = displayWidth(h)
 	}
 	for _, row := range dataRows {
 		for i, cell := range row {
-			if w := runeLen(cell); w > colWidths[i] {
+			if w := displayWidth(cell); w > colWidths[i] {
 				colWidths[i] = w
 			}
 		}
@@ -638,11 +678,6 @@ func renderTableBlock(b *strings.Builder, block mdBlock) {
 	}
 }
 
-// runeLen 计算字符串的可见字符宽度（按 rune 计数，兼容中文）。
-func runeLen(s string) int {
-	return len([]rune(s))
-}
-
 // renderTableRow 渲染一行表格（对单元格内容做 inline 格式渲染，列对齐）。
 func renderTableRow(cells []string, widths []int, aligns []tableAlign) string {
 	// 先渲染每个单元格的 inline 格式，得到带 ANSI 的文本
@@ -654,9 +689,12 @@ func renderTableRow(cells []string, widths []int, aligns []tableAlign) string {
 	var b strings.Builder
 	b.WriteString(mdTableBorder.Render("|"))
 	for i := range widths {
-		// 用纯文本算填充量
-		pureLen := runeLen(cells[i])
-		pad := widths[i] - pureLen
+		// 用纯文本的显示宽度算填充量（中文占两列）
+		pureWidth := displayWidth(cells[i])
+		pad := widths[i] - pureWidth
+		if pad < 0 {
+			pad = 0
+		}
 		leftPad, rightPad := 0, 0
 		switch aligns[i] {
 		case alignRight:
@@ -764,9 +802,14 @@ func (m Model) View() tea.View {
 		if m.pending != nil && m.currentPending < len(m.pending.Items) {
 			// 人机协作弹框模式
 			status = confirmStatusBar(m)
-			content = m.viewport.View() + "\n" + confirmBox(m) + "\n" + status
+			lines, _ := confirmBoxLines(m)
+			content = m.viewport.View() + "\n" + strings.Join(lines, "\n") + "\n" + status
 		} else if m.busy {
-			status = m.spinner.View() + " 思考中…（模型可能正在调用工具）"
+			status = m.spinner.View() + " 思考中…"
+			if !m.busySince.IsZero() {
+				status += fmt.Sprintf(" %ds", int(time.Since(m.busySince).Seconds()))
+			}
+			status += "（模型可能正在调用工具）"
 			content = m.viewport.View() + "\n" + status + "\n" + m.input.View()
 		} else {
 			content = m.viewport.View() + "\n" + status + "\n" + m.input.View()
@@ -779,47 +822,453 @@ func (m Model) View() tea.View {
 	return v
 }
 
-// confirmBox 渲染人机协作弹框。
-func confirmBox(m Model) string {
+// boxWidth 返回确认弹框宽度，避免超出终端宽度。
+func (m Model) boxWidth() int {
+	w := m.width
+	if w <= 0 || w > 72 {
+		w = 72
+	}
+	if w < 40 {
+		w = 40
+	}
+	return w
+}
+
+// confirmBoxLines 渲染人机协作弹框。
+//
+// 返回逐行文本，以及「行号 → 选项」的映射，供鼠标点击定位使用。
+// 映射的值 "yr" 表示该行左半区是允许、右半区是拒绝，"an" 同理。
+func confirmBoxLines(m Model) ([]string, map[int]string) {
 	if m.pending == nil || m.currentPending >= len(m.pending.Items) {
-		return ""
+		return nil, nil
 	}
 
 	item := m.pending.Items[m.currentPending]
 	total := len(m.pending.Items)
 
-	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString("┌──────── 🔔 需要你确认 ────────\n")
-	b.WriteString(fmt.Sprintf("│ 第 %d / %d 项\n", m.currentPending+1, total))
-	b.WriteString(fmt.Sprintf("│ 工具: %s\n", item.ToolName))
-	b.WriteString(fmt.Sprintf("│ 风险: %s  %s\n", item.Decision.RiskLevel, item.Decision.Reason))
+	width := m.boxWidth()
+	inner := width - 2 // 去掉左右竖线
 
-	// 展示参数（truncate 超长）
-	if item.ArgsJSON != "" && len(item.ArgsJSON) < 200 {
-		b.WriteString(fmt.Sprintf("│ 参数: %s\n", item.ArgsJSON))
-	} else if item.ArgsJSON != "" {
-		b.WriteString(fmt.Sprintf("│ 参数: %s...\n", item.ArgsJSON[:190]))
+	title := " [!] 需要你确认 "
+	if total > 1 {
+		title = fmt.Sprintf(" [!] 需要你确认 (%d/%d) ", m.currentPending+1, total)
 	}
 
-	b.WriteString("│\n")
-	b.WriteString("│ [Y] 允许  [R] 拒绝  [A] 全部允许  [N] 全部拒绝\n")
-	b.WriteString("└───────────────────────────────\n")
+	// 只保留三件事：做什么、示例、会产生什么影响。
+	headline, details := describePending(item, m.workdir)
 
-	return b.String()
+	lines := []string{
+		"┌" + centerLabel(title, inner) + "┐",
+		boxLine(headline, inner),
+	}
+	for _, d := range details {
+		lines = append(lines, boxLine(d, inner))
+	}
+
+	// 选项行中间有分隔竖线，按 inner-1 切分左右两半，保证整行宽度等于 width。
+	half := (inner - 1) / 2
+	rest := inner - 1 - half
+	optRow1 := len(lines)
+	lines = append(lines,
+		"│"+fitWidth(" [Y] 允许", half)+"│"+fitWidth(" [R] 拒绝", rest)+"│",
+		"│"+fitWidth(" [A] 全部允许", half)+"│"+fitWidth(" [N] 全部拒绝", rest)+"│",
+	)
+	lines = append(lines, "└"+strings.Repeat("─", inner)+"┘")
+
+	actions := map[int]string{
+		optRow1:     "yr",
+		optRow1 + 1: "an",
+	}
+	return lines, actions
+}
+
+// describePending 把一次待确认的工具调用翻译成人话。
+//
+// headline 是「做什么」（含目标路径），details 只放一条示例和一条影响说明，
+// 用户扫一眼就能判断该不该授权。
+func describePending(item agent.PendingItem, workdir string) (string, []string) {
+	name := strings.ToLower(item.ToolName)
+	args := item.ArgsMap
+	path := prettyPath(pathArg(args), workdir)
+
+	switch {
+	case containsAny(name, "delete", "remove", "unlink", "truncate", "drop", "purge", "rmdir", "clear"):
+		return withPath("删除", path), []string{
+			"影响: 会被彻底删除，无法撤销",
+		}
+
+	case containsAny(name, "mkdir", "create_directory", "create_dir"):
+		return withPath("新建目录", path), []string{
+			"影响: 只创建目录，不改动已有文件",
+		}
+
+	case containsAny(name, "move", "rename"):
+		dst := prettyPath(stringArg(args,
+			[]string{"destination", "dest", "dst", "newPath", "new_path", "to"},
+			[]string{"destination", "dst", "target"}), workdir)
+		headline := withPath("移动", path)
+		if dst != "" {
+			headline += " → " + dst
+		}
+		return headline, []string{
+			"影响: 原位置消失，内容出现在新位置",
+		}
+
+	case containsAny(name, "edit", "patch", "replace"):
+		headline := withPath("修改文件", path)
+		if n := countListArg(args, "edits", "changes", "patches"); n > 0 {
+			headline += fmt.Sprintf(" · %d 处替换", n)
+		}
+		details := []string{}
+		if preview := editPreview(args); preview != "" {
+			details = append(details, preview)
+		}
+		details = append(details, "影响: 文件内容被改写，无法自动撤销")
+		return headline, details
+
+	case containsAny(name, "write", "create", "append", "save", "put", "upload"):
+		headline := withPath("写入文件", path)
+		if content := stringArg(args, []string{"content", "text", "data"},
+			[]string{"content", "text", "data"}); content != "" {
+			headline += fmt.Sprintf(" · 约 %d 行", strings.Count(content, "\n")+1)
+		}
+		return headline, []string{
+			"影响: 已有内容被覆盖，无法自动撤销",
+		}
+
+	case containsAny(name, "exec", "shell", "bash", "powershell", "terminal", "command", "cmd", "spawn", "run"):
+		cmd := truncateText(oneLine(stringArg(args,
+			[]string{"command", "cmd", "script"},
+			[]string{"command", "cmd", "script", "shell"})), 48)
+		if cmd == "" {
+			cmd = "（未提供命令内容）"
+		}
+		return "执行命令", []string{
+			"命令: " + cmd,
+			"影响: 在本机运行，可能修改或删除文件",
+		}
+
+	case containsAny(name, "read", "list", "search", "find", "glob", "grep", "tree",
+		"info", "stat", "cat", "head", "tail", "download"):
+		return withPath("查看", path), []string{
+			"影响: 只读取，不会修改文件",
+		}
+	}
+
+	details := summarizeArgs(args)
+	details = append(details, "影响: 由该工具功能决定")
+	return "调用工具 " + item.ToolName, details
+}
+
+// pathArg 从参数里找出表示目标路径的值。
+func pathArg(args map[string]any) string {
+	return stringArg(args,
+		[]string{"path", "file_path", "filepath", "filename", "file", "target", "source"},
+		[]string{"path", "file", "dir", "target", "source"})
+}
+
+// stringArg 优先按精确 key 取值；取不到时按关键字模糊匹配（MCP 工具参数命名不统一）。
+func stringArg(args map[string]any, exact []string, fuzzy []string) string {
+	if s := firstString(args, exact...); s != "" {
+		return s
+	}
+
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // 保证多次渲染结果稳定
+
+	for _, k := range keys {
+		lk := strings.ToLower(k)
+		for _, f := range fuzzy {
+			if !strings.Contains(lk, f) {
+				continue
+			}
+			if s, ok := args[k].(string); ok && strings.TrimSpace(s) != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// firstString 返回第一个存在的非空字符串参数。
+func firstString(args map[string]any, keys ...string) string {
+	for _, k := range keys {
+		v, ok := args[k]
+		if !ok {
+			continue
+		}
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// prettyPath 把工作目录内的绝对路径显示成相对路径，其余原样返回。
+func prettyPath(p, workdir string) string {
+	if strings.TrimSpace(p) == "" {
+		return ""
+	}
+	clean := filepath.Clean(p)
+	if workdir == "" {
+		return p
+	}
+	rel, err := filepath.Rel(workdir, clean)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return p
+	}
+	return rel
+}
+
+// withPath 把路径拼到句尾；没有路径时只保留动作描述。
+func withPath(prefix, path string) string {
+	if path == "" {
+		return prefix
+	}
+	return prefix + " " + path
+}
+
+// countListArg 返回列表型参数的元素个数（如 edits 的替换条目数）。
+func countListArg(args map[string]any, keys ...string) int {
+	for k, v := range args {
+		for _, want := range keys {
+			if !strings.EqualFold(k, want) {
+				continue
+			}
+			if list, ok := v.([]any); ok {
+				return len(list)
+			}
+		}
+	}
+	return 0
+}
+
+// editPreview 生成一条替换示例，让用户直观看到会改掉什么。
+func editPreview(args map[string]any) string {
+	var first map[string]any
+	for _, want := range []string{"edits", "changes", "patches"} {
+		for k, v := range args {
+			if !strings.EqualFold(k, want) {
+				continue
+			}
+			list, ok := v.([]any)
+			if !ok || len(list) == 0 {
+				continue
+			}
+			if m, ok := list[0].(map[string]any); ok {
+				first = m
+			}
+		}
+	}
+	if first == nil {
+		return ""
+	}
+
+	oldText := oneLine(firstString(first, "oldText", "old_text", "old", "from"))
+	newText := oneLine(firstString(first, "newText", "new_text", "new", "to"))
+
+	switch {
+	case oldText != "" && newText != "":
+		return fmt.Sprintf("例如: %q → %q", truncateText(oldText, 18), truncateText(newText, 18))
+	case oldText != "":
+		return fmt.Sprintf("例如: 删除 %q", truncateText(oldText, 24))
+	case newText != "":
+		return fmt.Sprintf("例如: 插入 %q", truncateText(newText, 24))
+	}
+	return ""
+}
+
+// summarizeArgs 把未知工具的参数压成几条 key: value 摘要。
+func summarizeArgs(args map[string]any) []string {
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var out []string
+	for _, k := range keys {
+		if len(out) >= 2 {
+			out = append(out, "…")
+			break
+		}
+		out = append(out, fmt.Sprintf("%s: %s", k, formatArgValue(args[k])))
+	}
+	return out
+}
+
+// formatArgValue 把任意参数值转成一行可读文本。
+func formatArgValue(v any) string {
+	if s, ok := v.(string); ok {
+		return truncateText(oneLine(s), 40)
+	}
+	return truncateText(fmt.Sprintf("%v", v), 40)
+}
+
+// oneLine 把多行文本压成一行，便于在弹框里展示。
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "↵")
+	s = strings.ReplaceAll(s, "\n", "↵")
+	s = strings.ReplaceAll(s, "\t", " ")
+	return strings.TrimSpace(s)
+}
+
+// truncateText 按终端显示宽度截断，超出部分用省略号表示。
+func truncateText(s string, maxWidth int) string {
+	if maxWidth <= 0 || displayWidth(s) <= maxWidth {
+		return s
+	}
+	var b strings.Builder
+	cur := 0
+	for _, r := range s {
+		rw := runeWidth(r)
+		if cur+rw > maxWidth-1 {
+			break
+		}
+		b.WriteRune(r)
+		cur += rw
+	}
+	return b.String() + "…"
+}
+
+// containsAny 判断 s 是否包含任意一个关键字。
+func containsAny(s string, keywords ...string) bool {
+	for _, k := range keywords {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// boxLine 把一行内容包进竖线并补齐宽度。
+func boxLine(s string, inner int) string {
+	return "│" + fitWidth(" "+s, inner) + "│"
+}
+
+// fitWidth 按终端显示宽度截断或右补空格，保证边框对齐。
+// 注意中文等全角字符占两列，不能按 rune 数算。
+func fitWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	w := displayWidth(s)
+	if w > width {
+		var b strings.Builder
+		cur := 0
+		for _, r := range s {
+			rw := runeWidth(r)
+			if cur+rw > width {
+				break
+			}
+			b.WriteRune(r)
+			cur += rw
+		}
+		s = b.String()
+		w = cur
+	}
+	if w < width {
+		s += strings.Repeat(" ", width-w)
+	}
+	return s
+}
+
+// centerLabel 把标题居中放进一行边框里，两侧用 ─ 填充。
+func centerLabel(s string, width int) string {
+	n := displayWidth(s)
+	if n >= width {
+		return s
+	}
+	left := (width - n) / 2
+	return strings.Repeat("─", left) + s + strings.Repeat("─", width-n-left)
+}
+
+// displayWidth 返回字符串在终端里的显示宽度（全角字符按两列计）。
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		w += runeWidth(r)
+	}
+	return w
+}
+
+// runeWidth 返回单个字符的显示宽度。
+func runeWidth(r rune) int {
+	if r >= 0x1100 && (r <= 0x115F ||
+		r == 0x2329 || r == 0x232A ||
+		(r >= 0x2E80 && r <= 0xA4CF && r != 0x303F) ||
+		(r >= 0xAC00 && r <= 0xD7A3) ||
+		(r >= 0xF900 && r <= 0xFAFF) ||
+		(r >= 0xFE30 && r <= 0xFE6F) ||
+		(r >= 0xFF00 && r <= 0xFF60) ||
+		(r >= 0xFFE0 && r <= 0xFFE6)) {
+		return 2
+	}
+	return 1
+}
+
+// handleConfirmClick 把鼠标点击位置映射成确认决策。
+//
+// 只有点在弹框的两行选项上才算命中；弹框紧跟在消息区下面，
+// 所以行号需要减去消息区高度才是弹框内的相对行号。
+func (m Model) handleConfirmClick(x, y int) (tea.Model, tea.Cmd, bool) {
+	lines, actions := confirmBoxLines(m)
+	if len(lines) == 0 {
+		return m, nil, false
+	}
+
+	row := y - m.viewport.Height()
+	action, ok := actions[row]
+	if !ok {
+		return m, nil, false
+	}
+
+	inner := m.boxWidth() - 2
+	half := (inner - 1) / 2
+	rightHalf := x >= half+2 // 跳过左侧边框和中间分隔竖线
+
+	switch action {
+	case "yr":
+		if rightHalf {
+			updated, cmd := m.confirmCurrent(false, true)
+			return updated, cmd, true
+		}
+		updated, cmd := m.confirmCurrent(true, true)
+		return updated, cmd, true
+	case "an":
+		if rightHalf {
+			updated, cmd := m.confirmAll(false)
+			return updated, cmd, true
+		}
+		updated, cmd := m.confirmAll(true)
+		return updated, cmd, true
+	}
+
+	return m, nil, false
 }
 
 // confirmStatusBar 是人机协作模式下的底部状态栏。
+// 弹框里不再展示工具名和风险等级，这里用一行补上，保持信息可追溯。
 func confirmStatusBar(m Model) string {
 	if m.pending == nil || m.currentPending >= len(m.pending.Items) {
 		return ""
 	}
 	item := m.pending.Items[m.currentPending]
-	return fmt.Sprintf("等待决策: %s · %s  [Y]允许 [R]拒绝 [A]全允许 [N]全拒绝",
-		item.ToolName, item.Decision.RiskLevel)
+	s := fmt.Sprintf("工具: %s · %s", item.ToolName, item.Decision.RiskLevel)
+	if m.width > 0 {
+		s = truncateText(s, m.width-1)
+	}
+	return s
 }
 
 func Run() error {
+	// MCP 子进程（如 npx 启动的 server）首次握手可能耗时十几秒，
+	// 先给个提示，避免界面看起来像卡死。
+	fmt.Print("正在连接 MCP 服务，请稍候…\r")
 	model, err := NewModel()
 	if err != nil {
 		return err

@@ -2,9 +2,20 @@ package tools
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
+
+// workdirRoot 返回项目根目录（当前工作目录）的绝对路径。
+// run_command 等以项目为工作区的工具用它定位执行目录。
+func workdirRoot() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return wd
+}
 
 // resolvePathWithin 校验并解析路径，确保目标位于 root 之内（含符号链接检查），
 // 返回解析后的真实绝对路径。

@@ -260,7 +260,7 @@ func connectOne(ctx context.Context, name string, server ServerConfig) (*sdkmcp.
 
 		lastErr = err
 		if attempt < maxAttempts {
-			// 指数退避：100ms → 200ms → 400ms
+			// 指数退避：50ms → 100ms → 200ms
 			backoff := time.Duration(50*(1<<(attempt-1))) * time.Millisecond
 			select {
 			case <-ctx.Done():
@@ -280,6 +280,8 @@ func buildTransport(server ServerConfig) (sdkmcp.Transport, error) {
 		return buildStdioTransport(server)
 	case TransportSSE:
 		return buildSSETransport(server)
+	case TransportStreamable:
+		return buildStreamableTransport(server)
 	default:
 		return nil, fmt.Errorf("未知传输类型: %s", server.GetTransport())
 	}
@@ -342,6 +344,32 @@ func buildSSETransport(server ServerConfig) (sdkmcp.Transport, error) {
 	}
 
 	return &sdkmcp.SSEClientTransport{
+		Endpoint:   server.URL,
+		HTTPClient: httpClient,
+	}, nil
+}
+
+// buildStreamableTransport 构造 Streamable HTTP 传输层（MCP 2025-03 规范）。
+// 与传统 SSE 的区别：单一 endpoint，POST 请求响应可以是 JSON 或 SSE 流，
+// 不再需要先挂 SSE 长连接获取独立的消息 endpoint。
+// GitHub 官方远程 MCP 服务（api.githubcopilot.com/mcp/）即使用此协议。
+func buildStreamableTransport(server ServerConfig) (sdkmcp.Transport, error) {
+	if strings.TrimSpace(server.URL) == "" {
+		return nil, fmt.Errorf("streamable 传输需要配置 url")
+	}
+
+	httpClient := &http.Client{}
+
+	// 配置了 headers 时，复用 headerTransport 注入（常用于 Authorization）
+	if len(server.Headers) > 0 {
+		headers := http.Header{}
+		for key, value := range server.Headers {
+			headers.Set(key, value)
+		}
+		httpClient.Transport = &headerTransport{headers: headers}
+	}
+
+	return &sdkmcp.StreamableClientTransport{
 		Endpoint:   server.URL,
 		HTTPClient: httpClient,
 	}, nil
@@ -624,11 +652,16 @@ func isConnectionError(err error) bool {
 
 	msg := strings.ToLower(err.Error())
 
-	// 这些关键词通常出现在 transport 已关闭、链路断开的场景下
+	// 这些关键词通常出现在 transport 已关闭、链路断开的场景下。
+	// 这里刻意不写裸 "closed"：像 "input stream closed by server policy"
+	// 这类业务级关闭提示会把整个 server 误判为 dead。
 	connectionKeywords := []string{
 		"eof",
 		"unexpected eof",
-		"closed",
+		"connection closed",
+		"session closed",
+		"client closed",
+		"closed by server",
 		"broken pipe",
 		"connection reset",
 		"connection refused",
