@@ -43,7 +43,8 @@ var RunCommandTool = Tool{
 	},
 	// 执行类基础等级 L2，配合 classifyBySemantics 的 toolKindExec 结果保持一致。
 	// 即使用户配置了 RiskOverrides 降级，黑名单 pattern 仍然兜底。
-	RiskLevel: L2Review,
+	RiskLevel:    L2Review,
+	ExplicitRisk: true,
 	Execute: func(ctx context.Context, args map[string]any) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err

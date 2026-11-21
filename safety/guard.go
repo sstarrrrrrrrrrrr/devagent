@@ -258,24 +258,20 @@ func classifyTool(name string) toolKind {
 	return toolKindUnknown
 }
 
-// autoClassify 按工具语义 + 参数路径自动推断风险等级。
+// autoClassify 决定一次调用的基础风险等级。
 //
-// 关键规则：
-//   - 只读工具访问工作目录内 → L0 直接放行（看自己项目的代码不需要确认）
-//   - 只读工具访问工作目录外 → L1 需要确认（不该看的文件要看一眼）
+// 本地工具都显式声明了 RiskLevel（ExplicitRisk=true），以声明为准
+// （L0 放行 / L1、L2 确认 / L3 拒绝）；MCP 工具的 RiskLevel 只是占位值，
+// 按语义 + 参数路径推断：
+//   - 只读工具访问工作目录内 → L0 直接放行
+//   - 只读工具访问工作目录外 → L1 需要确认
 //   - 写入 / 删除 / 命令执行 → L2 需要审核
-//   - 无法识别的工具 → L1 保守确认
-//   - 工具自己声明了 L2/L3 时作为风险下界，关键词推断不能把它降级
-//
-// 注意 L0/L1 的声明不作为下界：MCP 工具统一被标记为 L1Confirm 占位，
-// 若当成下界会让只读工具重新变成需要确认。
+//   - 无法识别的工具 → DefaultRisk（默认 L1）
 func (g *SafetyGuard) autoClassify(tool projecttools.Tool, args map[string]any) (projecttools.RiskLevel, string) {
-	level, reason := g.classifyBySemantics(tool, args)
-
-	if tool.RiskLevel >= projecttools.L2Review && tool.RiskLevel > level {
+	if tool.ExplicitRisk {
 		return tool.RiskLevel, fmt.Sprintf("工具声明的风险等级为 %s，按该等级处理", tool.RiskLevel)
 	}
-	return level, reason
+	return g.classifyBySemantics(tool, args)
 }
 
 // classifyBySemantics 只按工具名语义和参数路径推断等级。
@@ -466,9 +462,19 @@ func normalizeMatchPath(p string) string {
 	return p
 }
 
-// parseRiskLevel 解析 risk level 字符串（大小写不敏感）。
+// parseRiskLevel 解析 risk level 字符串。
+// 大小写、连字符、下划线、空格均不敏感：
+// "L3-Blocked" / "l3_blocked" / "L3 Blocked" 都等价于 "l3blocked"。
 func parseRiskLevel(s string) (projecttools.RiskLevel, bool) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
+	normalized := strings.Map(func(r rune) rune {
+		switch r {
+		case '-', '_', ' ', '\t':
+			return -1
+		}
+		return r
+	}, strings.ToLower(strings.TrimSpace(s)))
+
+	switch normalized {
 	case "l0", "l0safe", "safe":
 		return projecttools.L0Safe, true
 	case "l1", "l1confirm", "confirm":
@@ -487,9 +493,9 @@ func parseRiskLevel(s string) (projecttools.RiskLevel, bool) {
 // wrapWithSafetyGuard 用安全拦截器包装原始 Tool.Execute。
 //
 // 返回的新 Tool.Execute 行为：
-//  - ActionAllow → 直接调用原始 Execute
-//  - ActionBlock → 返回 error "此操作被安全策略禁止"
-//  - ActionRequireConfirm → 返回 error ErrRequireConfirm
+//   - ActionAllow → 直接调用原始 Execute
+//   - ActionBlock → 返回 error "此操作被安全策略禁止"
+//   - ActionRequireConfirm → 返回 error ErrRequireConfirm
 //
 // Agent 的 runTool 捕获到 ErrRequireConfirm 后，会调用 SafetyGuard.Decide()
 // 重新拿到完整 Decision（Decision 是纯计算，无副作用，重调一次无成本）。

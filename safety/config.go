@@ -10,10 +10,11 @@ import (
 //
 // 拦截器链的处理顺序（优先级从高到低）：
 //  1. Blocklist 命中 → 直接 L3-Blocked（拒绝）
-//  2. Whitelist 命中 → 跳过所有后续检查，直接放行（保留工具原始 RiskLevel）
-//  3. RiskLevel 策略 → 工具自己声明的基础等级
-//  4. 参数级规则 → 根据路径/命令等参数动态升级或降级
-//  5. 兜底 → 未知工具默认 L1-Confirm
+//  2. Whitelist 命中 → 跳过所有后续检查，直接 L0-Safe 放行
+//  3. RiskOverrides 命中 → 使用用户配置的等级
+//  4. 本地工具 → 使用工具显式声明的 RiskLevel
+//     MCP 工具 → 按工具名/参数语义推断
+//  5. 兜底 → 未知等级默认 L1-Confirm
 type SafetyConfig struct {
 	// Workdir 指定工作目录根路径，用于路径沙箱。留空则自动取 os.Getwd()。
 	Workdir string `json:"workdir,omitempty"`

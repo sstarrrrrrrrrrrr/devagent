@@ -48,8 +48,13 @@ type Tool struct {
 	// RiskLevel 工具的基础风险等级。
 	// SafetyGuard.Decide() 会根据策略/参数动态调整，此值为初始值。
 	RiskLevel RiskLevel
-}
 
+	// ExplicitRisk 为 true 表示 RiskLevel 是工具显式声明的等级，优先于语义推断。
+	// 本地工具都应设为 true；MCP 工具的 RiskLevel 只是占位值，保持 false，
+	// 由 SafetyGuard 按工具名/参数语义推断。
+	// 默认 false 是为了让忘记声明的工具回落到语义推断，而不是被当成 L0 放行。
+	ExplicitRisk bool
+}
 
 // ToOpenAITool 把工具转成 OpenAI 的工具声明。
 func (t Tool) ToOpenAITool() responses.ToolUnionParam {
@@ -63,11 +68,14 @@ func (t Tool) ToOpenAITool() responses.ToolUnionParam {
 }
 
 // All 是 Agent 使用的本地工具集合，新增本地工具时在这里登记。
-// 除 run_command 外都是只读的 L0Safe；run_command 是执行类 L2Review，
-// 由 SafetyGuard 强制走用户审核。
+// run_command 是执行类 L2Review，由 SafetyGuard 强制走用户审核；
+// open_preview 涉及启动进程，L1Confirm；其余只读 L0Safe。
 var All = []Tool{
 	ReadFileTool,
 	CurrentDirTool,
 	ListFilesTool,
 	RunCommandTool,
+	LoadSkillTool,
+	ReadSkillFileTool,
+	OpenPreviewTool,
 }
