@@ -217,11 +217,6 @@ func (m *Manager) TryReconnectAll(ctx context.Context) []string {
 
 // connectOne 连接单个 MCP Server，带 per-server 独立超时和重试。
 func connectOne(ctx context.Context, name string, server ServerConfig) (*sdkmcp.ClientSession, error) {
-	transport, err := buildTransport(server)
-	if err != nil {
-		return nil, fmt.Errorf("构造传输层失败: %w", err)
-	}
-
 	client := sdkmcp.NewClient(
 		&sdkmcp.Implementation{
 			Name:    "devagent",
@@ -235,6 +230,14 @@ func connectOne(ctx context.Context, name string, server ServerConfig) (*sdkmcp.
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// transport 必须在每次尝试时重新构造：stdio 的 CommandTransport.Connect
+		// 内部会执行 Cmd.Start()，复用同一个实例时第二次必然报
+		// "exec: already started"，导致重试配置完全失效。
+		transport, err := buildTransport(server)
+		if err != nil {
+			return nil, fmt.Errorf("构造传输层失败: %w", err)
+		}
+
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		session, err := client.Connect(attemptCtx, transport, nil)
 		cancel()
@@ -255,7 +258,7 @@ func connectOne(ctx context.Context, name string, server ServerConfig) (*sdkmcp.
 		}
 	}
 
-	return nil, fmt.Errorf("重试 %d 次后仍失败: %w", maxAttempts, lastErr)
+	return nil, fmt.Errorf("共尝试 %d 次仍失败: %w", maxAttempts, lastErr)
 }
 
 // buildTransport 根据 ServerConfig 构造对应的 Transport 实现。
@@ -298,9 +301,8 @@ type headerTransport struct {
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	cloned := req.Clone(req.Context())
 	for key, values := range t.headers {
-		for _, value := range values {
-			cloned.Header.Set(key, value)
-		}
+		// 直接赋值而不是 Set：保留多值 Header，同时复制切片避免共享底层数组
+		cloned.Header[key] = append([]string(nil), values...)
 	}
 
 	base := t.base
@@ -596,10 +598,6 @@ func ExtractText(result *sdkmcp.CallToolResult) (string, error) {
 		return "", fmt.Errorf("MCP 工具返回结果为空")
 	}
 
-	if result.IsError {
-		return "", fmt.Errorf("MCP 工具执行失败")
-	}
-
 	var output strings.Builder
 
 	for _, item := range result.Content {
@@ -618,7 +616,18 @@ func ExtractText(result *sdkmcp.CallToolResult) (string, error) {
 		}
 	}
 
-	return output.String(), nil
+	text := output.String()
+
+	// IsError 时把服务端返回的文本带进错误里，模型才能据此自纠
+	// （例如工具不存在、参数不匹配、文件不存在）。
+	if result.IsError {
+		if detail := strings.TrimSpace(text); detail != "" {
+			return "", fmt.Errorf("MCP 工具执行失败: %s", detail)
+		}
+		return "", fmt.Errorf("MCP 工具执行失败（服务端未返回错误详情）")
+	}
+
+	return text, nil
 }
 
 // isConnectionError 判断 error 是否属于「连接级故障」——
