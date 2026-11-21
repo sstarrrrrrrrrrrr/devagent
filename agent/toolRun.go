@@ -45,7 +45,7 @@ func runTool(
 	var args map[string]any
 	if err := json.Unmarshal([]byte(item.Arguments.OfString), &args); err != nil {
 		return RunResult{
-			ToolCall:  buildToolCall(item),
+			ToolCall:   buildToolCall(item),
 			ToolOutput: buildToolOutput(item, fmt.Sprintf("工具参数解析失败: %v", err)),
 		}
 	}
@@ -54,7 +54,7 @@ func runTool(
 	tool, exists := toolExecutors[item.Name]
 	if !exists {
 		return RunResult{
-			ToolCall:  buildToolCall(item),
+			ToolCall:   buildToolCall(item),
 			ToolOutput: buildToolOutput(item, fmt.Sprintf("工具不存在: %s", item.Name)),
 		}
 	}
@@ -98,7 +98,7 @@ func runTool(
 	}
 
 	return RunResult{
-		ToolCall:  buildToolCall(item),
+		ToolCall:   buildToolCall(item),
 		ToolOutput: buildToolOutput(item, result),
 	}
 }
