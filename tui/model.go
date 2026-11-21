@@ -35,23 +35,23 @@ var (
 
 // 用于 Markdown 渲染的样式与正则。
 var (
-	mdHeading    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	mdCodeBlock  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	mdInlineCode = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Background(lipgloss.Color("236"))
-	mdBold       = lipgloss.NewStyle().Bold(true)
-	mdItalic     = lipgloss.NewStyle().Italic(true)
-	mdQuote      = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
-	mdLink       = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Underline(true)
+	mdHeading     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	mdCodeBlock   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	mdInlineCode  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Background(lipgloss.Color("236"))
+	mdBold        = lipgloss.NewStyle().Bold(true)
+	mdItalic      = lipgloss.NewStyle().Italic(true)
+	mdQuote       = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	mdLink        = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Underline(true)
 	mdTableBorder = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 
-	headingRe    = regexp.MustCompile(`^#{1,6}\s`)
-	hrRe         = regexp.MustCompile(`^\s*([-*_]\s*){3,}$`)
-	tableRowRe   = regexp.MustCompile(`^\s*\|.*\|\s*$`)
-	tableSepRe   = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$`)
-	inlineCodeRe = regexp.MustCompile("`[^`]+`")
-	inlineBoldRe = regexp.MustCompile(`\*\*[^*]+\*\*`)
+	headingRe      = regexp.MustCompile(`^#{1,6}\s`)
+	hrRe           = regexp.MustCompile(`^\s*([-*_]\s*){3,}$`)
+	tableRowRe     = regexp.MustCompile(`^\s*\|.*\|\s*$`)
+	tableSepRe     = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$`)
+	inlineCodeRe   = regexp.MustCompile("`[^`]+`")
+	inlineBoldRe   = regexp.MustCompile(`\*\*[^*]+\*\*`)
 	inlineItalicRe = regexp.MustCompile(`\*[^*]+\*`)
-	inlineLinkRe = regexp.MustCompile(`\[[^\]]+\]\([^)]*\)`)
+	inlineLinkRe   = regexp.MustCompile(`\[[^\]]+\]\([^)]*\)`)
 )
 
 // mdBlock 表示 Markdown 中一个独立的块。
@@ -76,22 +76,22 @@ type chatMessage struct {
 }
 
 type Model struct {
-	input       textinput.Model
-	viewport    viewport.Model
-	spinner     spinner.Model
-	agent       *agent.Agent
-	session     *session.Session
-	messages    []chatMessage
-	busy        bool
-	busySince   time.Time // 本次等待开始时间，用于在状态栏展示耗时
-	width       int
-	height      int
-	workdir     string // 工作目录，用于把绝对路径显示成相对路径
-	ready       bool
+	input     textinput.Model
+	viewport  viewport.Model
+	spinner   spinner.Model
+	agent     *agent.Agent
+	session   *session.Session
+	messages  []chatMessage
+	busy      bool
+	busySince time.Time // 本次等待开始时间，用于在状态栏展示耗时
+	width     int
+	height    int
+	workdir   string // 工作目录，用于把绝对路径显示成相对路径
+	ready     bool
 
 	// pending 人机协作暂停状态
 	pending        *agent.PendingQueue
-	currentPending int // 当前正在审核的 item 索引
+	currentPending int    // 当前正在审核的 item 索引
 	approvals      []bool // 累积的用户决策（每个 item 是否允许）
 }
 
@@ -271,8 +271,9 @@ func (m Model) handleAgentResult(msg agentResultMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleConfirmKeys 处理人机协作弹框里的用户按键。
-// 支持三种快捷决策：
-//   y → 允许当前 item，r → 拒绝当前 item，a → 允许全部，n → 拒绝全部
+// 支持三种快捷决策（批量键只作用于本轮剩余项，不是永久偏好）：
+//
+//	y → 允许当前 item，r → 拒绝当前 item，a → 允许本轮剩余，n → 拒绝本轮剩余
 func (m Model) handleConfirmKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.pending == nil || m.currentPending >= len(m.pending.Items) {
 		m.pending = nil
@@ -870,8 +871,8 @@ func confirmBoxLines(m Model) ([]string, map[int]string) {
 	rest := inner - 1 - half
 	optRow1 := len(lines)
 	lines = append(lines,
-		"│"+fitWidth(" [Y] 允许", half)+"│"+fitWidth(" [R] 拒绝", rest)+"│",
-		"│"+fitWidth(" [A] 全部允许", half)+"│"+fitWidth(" [N] 全部拒绝", rest)+"│",
+		"│"+fitWidth(" [Y] 允许当前", half)+"│"+fitWidth(" [R] 拒绝当前", rest)+"│",
+		"│"+fitWidth(" [A] 允许本轮剩余", half)+"│"+fitWidth(" [N] 拒绝本轮剩余", rest)+"│",
 	)
 	lines = append(lines, "└"+strings.Repeat("─", inner)+"┘")
 
@@ -923,7 +924,7 @@ func describePending(item agent.PendingItem, workdir string) (string, []string) 
 		if preview := editPreview(args); preview != "" {
 			details = append(details, preview)
 		}
-		details = append(details, "影响: 文件内容被改写，无法自动撤销")
+		details = append(details, "影响: 文件内容被改写，当前流程不支持自动回滚")
 		return headline, details
 
 	case containsAny(name, "write", "create", "append", "save", "put", "upload"):
@@ -933,7 +934,7 @@ func describePending(item agent.PendingItem, workdir string) (string, []string) 
 			headline += fmt.Sprintf(" · 约 %d 行", strings.Count(content, "\n")+1)
 		}
 		return headline, []string{
-			"影响: 已有内容被覆盖，无法自动撤销",
+			"影响: 已有内容会被覆盖，当前流程不支持自动回滚",
 		}
 
 	case containsAny(name, "exec", "shell", "bash", "powershell", "terminal", "command", "cmd", "spawn", "run"):
