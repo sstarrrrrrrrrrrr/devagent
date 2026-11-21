@@ -21,8 +21,8 @@ import (
 
 // 默认值。
 const (
-	defaultMaxToolRounds  = 10
-	maxRepeatToolCalls    = 3 // 同一工具+相同参数连续调用超过此次数即视为循环
+	defaultMaxToolRounds = 10
+	maxRepeatToolCalls   = 3 // 同一工具+相同参数连续调用超过此次数即视为循环
 )
 
 // Agent 负责协调大模型、工具和对话历史。
@@ -86,16 +86,26 @@ func newHTTPClient() *http.Client {
 				}(ip)
 			}
 
+			var winner net.Conn
 			var firstErr error
 			for i := 0; i < len(ips); i++ {
 				r := <-results
 				if r.err == nil {
-					cancel() // 让其余还在拨号的 goroutine 尽快退出
-					return r.conn, nil
+					if winner == nil {
+						winner = r.conn
+						cancel() // 让其余还在拨号的 goroutine 尽快退出
+					} else {
+						// 落败但已经建立的连接必须关闭，否则会泄漏
+						r.conn.Close()
+					}
+					continue
 				}
 				if firstErr == nil {
 					firstErr = r.err
 				}
+			}
+			if winner != nil {
+				return winner, nil
 			}
 			return nil, firstErr
 		},
@@ -318,7 +328,7 @@ func (a *Agent) hasDeadServers() bool {
 //   - answer != "" + pending == nil   → 对话完成
 //   - answer != "" + err != nil       → 对话完成但有错误需要展示
 //   - pending != nil                  → 暂停，等用户确认 pending.Queue 里的工具调用
-//                                      （调用方处理完后应调 ResumeAgent）
+//     （调用方处理完后应调 ResumeAgent）
 //
 // 四层终止保护（实现见 modelLoop）：
 //  1. 系统提示词约束模型主动收口（见 instructions() 第 10 条）
@@ -423,8 +433,17 @@ func (a *Agent) modelLoop(
 		var toolCalls []responses.ResponseInputItemUnionParam
 		var toolOutputs []responses.ResponseInputItemUnionParam
 		var pendingItems []PendingItem
+		var assistantTexts []string
 
 		for _, item := range resp.Output {
+			// 同一次响应里，模型可能边说明边调用工具（message + function_call）。
+			// 这些说明文字也要写回 History，否则多轮后模型会丢失自己的推理上下文。
+			if item.Type == "message" {
+				if text := outputItemText(item); text != "" {
+					assistantTexts = append(assistantTexts, text)
+				}
+				continue
+			}
 			if item.Type != "function_call" {
 				continue
 			}
@@ -471,6 +490,11 @@ func (a *Agent) modelLoop(
 			answer := resp.OutputText()
 			s.History = append(s.History, message("assistant", answer))
 			return loopState{outcome: loopDone, answer: answer}
+		}
+
+		// 本轮的过程性说明写在 function_call 之前，和模型输出的顺序保持一致。
+		for _, text := range assistantTexts {
+			s.History = append(s.History, message("assistant", text))
 		}
 
 		// 有需要用户确认的工具 → 先暂停。
@@ -619,6 +643,17 @@ func message(role, text string) responses.ResponseInputItemUnionParam {
 	}
 }
 
+// outputItemText 提取一条 message 输出项里的文本内容。
+func outputItemText(item responses.ResponseOutputItemUnion) string {
+	var b strings.Builder
+	for _, content := range item.Content {
+		if content.Type == "output_text" {
+			b.WriteString(content.Text)
+		}
+	}
+	return b.String()
+}
+
 // buildModelParams 统一构造模型请求参数。
 func (a *Agent) buildModelParams(
 	input responses.ResponseNewParamsInputUnion,
@@ -647,6 +682,9 @@ func (a *Agent) instructions() string {
 	b.WriteString("\n\n二、当前可用工具")
 	b.WriteString("\n以下是当前实际注册、可被调用的工具，你的能力严格以这份列表为准：")
 	b.WriteString(a.toolList())
+
+	// 技能索引：skills/ 目录有内容时才拼接这一小节
+	b.WriteString(tools.SkillListPrompt())
 
 	b.WriteString("\n\n三、工具使用规则")
 	b.WriteString("\n1. 当用户要求执行某个工具能完成的操作时，优先调用对应工具获取真实信息，而不是凭记忆猜测。")
